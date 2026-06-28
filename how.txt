@@ -1,0 +1,153 @@
+Both installed. Here's a summary of everything created:
+
+---
+What was built
+
+Ethical_ticket_system/
+├── api/
+│   └── main.py          ← FastAPI server, loads your .joblib model
+└── frontend/
+    ├── package.json
+    ├── tsconfig.json
+    ├── next.config.mjs
+    └── app/
+        ├── layout.tsx
+        ├── page.tsx              ← UI form with 4 inputs + result display
+        └── api/predict/
+            └── route.ts          ← Next.js proxies to Python on port 8000
+
+To run it
+
+Terminal 1 — Python API (from the project root):
+.venv\Scripts\uvicorn api.main:app --reload
+
+Terminal 2 — Next.js (from frontend/):
+npm run dev
+
+Then open http://localhost:3000. The form sends inputs → Next.js API route → FastAPI → your model → returns discount % and audit trail back to the page.
+
+✻ Cogitated for 3m 37s
+
+※ recap: Built a Next.js frontend and FastAPI backend to connect to your ethical discount model. Run uvicorn in one terminal and npm run dev in another to test it live. (disable recaps in /config)
+
+❯ can you explain how it works in detail
+
+Here's a detailed walkthrough of the full system:
+
+---
+The Two Servers
+
+When you run the project, two separate servers are running simultaneously:
+
+- Python/FastAPI on http://localhost:8000 — owns the ML model
+- Next.js on http://localhost:3000 — owns the UI
+
+They don't share memory or process space. They only communicate over HTTP.
+
+---
+Step-by-Step Request Flow
+
+1. User fills the form (app/page.tsx)
+
+page.tsx is a Client Component ("use client" at the top), meaning it runs in the browser. It holds the form state in React's useState:
+
+const [form, setForm] = useState({
+  distance_miles: 10,
+  loyalty_index: 5,
+  attendance_rate: 0.85,
+  scarcity: 0.3,
+});
+
+Each input is a controlled input — when you change a value, setForm updates that state immediately.
+
+---
+2. Form submits (handleSubmit)
+
+When you click Get Discount, handleSubmit runs:
+
+const res = await fetch("/api/predict", {
+  method: "POST",
+  body: JSON.stringify(form),
+});
+
+Notice the URL is /api/predict — that's a relative URL, so it goes to Next.js itself on port 3000, not directly to Python. This is intentional — the browser never talks to Python.
+
+---
+3. Next.js API Route intercepts it (app/api/predict/route.ts)
+
+Next.js has a built-in feature called API Routes. Any file at app/api/.../route.ts becomes a serverless endpoint on the Next.js server. So /api/predict maps to app/api/predict/route.ts.
+
+This code runs on the server (Node.js), not in the browser:
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+
+  const res = await fetch("http://localhost:8000/predict", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json();
+  return NextResponse.json(data);
+}
+
+It does one thing: proxy the request to your Python server on port 8000, then relay the response back to the browser. This is the bridge between JavaScript and Python.
+
+---
+4. FastAPI receives the request (api/main.py)
+
+FastAPI loads your model once at startup:
+
+model = joblib.load("ethical_discount_model_v1.joblib")
+
+The .joblib file is a serialized scikit-learn GradientBoostingRegressor object. joblib.load deserializes it back into a live Python object with a .predict() method — exactly as it was when script.py saved it.
+
+When the POST request arrives, Pydantic validates the JSON body against TicketRequest:
+
+class TicketRequest(BaseModel):
+    distance_miles: float
+    loyalty_index: int
+    attendance_rate: float
+    scarcity: float
+
+If any field is missing or the wrong type, FastAPI automatically returns a 422 error before your code even runs.
+
+---
+5. The model predicts
+
+input_df = pd.DataFrame([{ "Distance_Miles": ..., ... }])
+raw = model.predict(input_df)[0]
+
+The model expects a DataFrame with those exact column names (matching what it was trained on in script.py). It returns one float — the raw discount score.
+
+---
+6. Business rules are applied (the "ethical" layer)
+
+The raw model output is then passed through the same guardrails from script.py:
+
+- If attendance_rate < 0.40 → discount forced to 0.0 (absolute floor)
+- If attendance_rate < 0.60 AND loyalty_index > 2 → discount forced to 0.0 (scalper pattern)
+- If raw output exceeds 0.50 → clipped to 0.50 (commercial cap)
+- If raw output is negative → clipped to 0.0
+
+Each decision appends a human-readable note to audit_notes. This is what makes the system "ethical" — every decision is explained, not just output.
+
+---
+7. Response travels back
+
+FastAPI returns:
+{
+  "raw_model_output": 0.2341,
+  "final_discount": 0.2341,
+  "audit_trail": "PASS: Clean calculation within normal operational parameters."
+}
+
+This goes → Next.js API route → browser → setResult(data) → React re-renders the result block on the page.
+
+---
+Why the proxy layer exists
+
+The Next.js API route (route.ts) acts as a middleman for two reasons:
+
+1. CORS: Browsers block cross-origin requests by default. If page.tsx tried to fetch("http://localhost:8000/predict") directly, the browser would block it. By going through Next.js, the browser only ever talks to its own origin (localhost:3000).
+2. Security in production: In a real deployment, your Python server URL would be a private internal address. The browser never needs to know it exists — only the Next.js server does.
